@@ -1,0 +1,204 @@
+channel = "#ed-exchange" //slack notification channel
+buildNode = "build-slave" //build on nodes matching label
+composeBranch = "develop" //exchange-docker-compose repository branch to use
+
+def appName = "ed-exchange-network-server"
+def repoName = 'edexchange'
+def branchName = "${branch_name}"
+env.DIRECTORY_DB_USERNAME = "ccctc"
+env.DIRECTORY_DB_PASSWORD = "ccc.dev"
+env.PASSWORD = "sampleAppSecret"
+def environment = ""
+
+if (env.BRANCH_NAME =~ /feature/) {
+    environment = "ci"
+    deployNode = ""
+	env.IMAGE_TAG = "${env.BUILD_NUMBER}"
+	error "Deploy not supported for feature branchs"
+
+} else if (env.BRANCH_NAME == "develop") {
+//    environment = "qa"
+//	deployNode = "ed-exchange-network-qa"
+//	env.IMAGE_TAG = "latest"
+//	hostDns1 = ""
+//	route53Url = "https://edex-network-butte-qa.ccctechcenter.org"
+//	network_host_port = "8081"
+//	appUrl_network1 = "http://$hostDns1:$network_host_port"
+//	error "Deploy not supported for develop branch"
+	
+} else if (env.BRANCH_NAME == "master") {
+    environment = "pilot"
+	deployNode = 'ed-exchange-network-pilot'
+	hostDns1 = "ec2-52-42-15-142.us-west-2.compute.amazonaws.com"
+    route53Url = "https://edex-network-butte-pilot.ccctechcenter.org"
+	network_host_port = "8081"
+	appUrl_network1 = "http://$hostDns1:$network_host_port"
+   // error "Deployments to production not supported yet - need to build an environment"
+} else {
+    echo "deploys not supported yet on branch: " + env.BRANCH_NAME
+    error "Branch not supported for deployments: " + env.BRANCH_NAME 
+}
+
+//FIXME: need to determine whether we should use separate RDS for this
+//def NETWORK_DB_HOST = "drand4ec12g3p3.cdowbbihwnfz.us-west-2.rds.amazonaws.com"
+
+//def branch_name = "develop"
+
+currentBuild.displayName = "#${env.BUILD_NUMBER}-${branch_name}"
+
+//FIXME: should really use the registry + Rancher
+
+stage "Build"
+	node(buildNode){
+		
+		try {
+		 //checkout jenkins scripts
+        checkout changelog: false, poll: false, scm: [$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'jenkins-scripts']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '63b0b64f-edba-40cb-9c1e-c94a6f78c6e8', url: 'https://cccnext_auto@bitbucket.org/cccnext/jenkins-scripts.git']]]
+        helpers = load 'jenkins-scripts/utils/Helpers.groovy'
+
+        //setup tool environment
+        def mvnHome = tool 'M3'
+        env.PATH = "${mvnHome}/bin:${env.PATH}"
+        jdk = tool name: 'JDK8'
+        env.JAVA_HOME = "${jdk}"
+        //setup logio
+        //Helpers.setupLogio()
+        checkout([$class: 'GitSCM', branches: [[name: "${branch_name}"]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: repoName], [$class: 'CleanBeforeCheckout']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '63b0b64f-edba-40cb-9c1e-c94a6f78c6e8', url: "https://cccnext_auto@bitbucket.org/cccnext/${repoName}.git"]]])
+        //checkout changelog: false, poll: false, scm: [$class: 'GitSCM', branches: [[name: branch_name]], doGenerateSubmoduleConfigurations: false, extensions: submoduleCfg: [], userRemoteConfigs: [[credentialsId: '63b0b64f-edba-40cb-9c1e-c94a6f78c6e8', url: "https://cccnext_auto@bitbucket.org/cccnext/${repoName}.git"]]]
+       //git branch: branch_name, url: gitUrl
+
+        stage "compile"
+        dir(repoName) {
+            try {
+                sh "mvn -DskipTests clean install"
+        		stash includes: 'docker-compose-qa.yml,directoryServer/target/docker/database/*,networkServer/target/docker/database/*,docker-compose-directory-pilot.yml', name: 'compose-files'
+            } catch (all) {
+                slackSend channel: "${channel}", color: 'danger', message: "#${env.BUILD_NUMBER}-${branch_name} - Nework Server Build Failed in PILOT \nJob: ${env.BUILD_URL}"
+                error "build image failed"
+            }
+        stage "Tag image and push to docker hub"
+        sh 'docker images'
+
+        if(branchName =~ /release.*/ || branchName =="master"){
+            env.IMAGE_TAG = "${env.BUILD_NUMBER}"
+			//env.IMAGE_TAG = readFile('result')
+         }
+         print "IMAGE_TAG: ${env.IMAGE_TAG}"
+
+		sh "docker tag edex/directory-server ccctechcenter/directory-server:latest"
+		sh "docker tag edex/network-server ccctechcenter/network-server:latest"
+
+		docker.withRegistry('https://registry.ccctechcenter.org:5000', '00733feb-a287-4875-94ba-e6b5c16c56a8') {
+
+				  def app_directory = docker.image("ccctechcenter/directory-server:latest")
+				  def app_network = docker.image("ccctechcenter/network-server:latest")
+      			  app_directory.tag(env.IMAGE_TAG)
+      			  app_network.tag(env.IMAGE_TAG)
+      			  retry (3) {
+                    try {
+
+                    	 app_directory.push(env.IMAGE_tAG)
+						 app_network.push(env.IMAGE_tAG)
+                    }
+                    catch (all) {
+                        sleep 20
+                        error "Error pushing to docker hub"
+                    }
+                }
+		}
+		}
+	}
+}
+stage "deploy"
+	if(profile == "qa") {
+	node(deployNode) {   
+      //  if(branchName=="develop") {
+      //  	deployService('ed-exchange-stack', "", "ed-exchange-develop", tag, "9E37A978894A2C107271", "UfiZswHv5j8Lj1iTGKPXMbinKjM4PmZgDS9K7SjX")
+      // 	}
+      //  else {
+          try {
+              helpers.setupLogio("syslog")
+			  
+			  unstash "compose-files"
+
+              //sh "profile=$profile docker-compose down"
+              //FIXME: need to determine if we should use RDS for the DB store, or at least mount a data volume
+              sh "profile=$profile docker-compose -f docker-compose-network-pilot.yml up -d"
+              sh "profile=$profile docker-compose -f docker-compose-network-pilot.yml logs > network_server1_logs.out &"
+              sleep 60
+              sh "cat network_server1_logs.out"
+              archive '**/*logs.out'
+              stage "validate endpoints"
+              assert helpers.checkAppStatus(appUrl_network1 +"/home",10,15) == 0 : appUrl_network1 +"/home" + " was not accessible"
+              //FIXME: not able to validate https endpoints
+              //assert helpers.checkAppStatus(route53Url +"/home",10,15) == 0 : route53Url +"/home" + " was not accessible"
+              slackSend channel: "${channel}", color: 'good', message: "#${env.BUILD_NUMBER}-${branch_name} - Network Server Deploy Succeeded in PILOT Env: ${route53Url} \nJob: ${env.BUILD_URL}"
+          } catch (Exception e) {
+            // slackSend channel: "${channel}", color: 'danger', message: "#${env.BUILD_NUMBER}-${branch_name} - Network Server Deploy Failed in PILOT Env: ${route53Url} \nJob: ${env.BUILD_URL}"
+             error "deploy failed"
+          }
+      //  }
+	    }
+ 
+} 
+if(profile == "pilot") {
+		node(deployNode) {   
+      //  if(branchName=="develop") {
+      //  	deployService('ed-exchange-stack', "", "ed-exchange-develop", tag, "9E37A978894A2C107271", "UfiZswHv5j8Lj1iTGKPXMbinKjM4PmZgDS9K7SjX")
+      // 	}
+      //  else {
+          try {
+              helpers.setupLogio("syslog")
+			  
+			  unstash "compose-files"
+
+              //sh "profile=$profile docker-compose down"
+              //FIXME: need to determine if we should use RDS for the DB store, or at least mount a data volume
+              sh "profile=$profile docker-compose -f docker-compose-network-pilot.yml up -d"
+              sh "profile=$profile docker-compose -f docker-compose-network-pilot.yml logs > network_server1_logs.out &"
+              sleep 60
+              sh "cat network_server1_logs.out"
+              archive '**/*logs.out'
+              stage "validate endpoints"
+              assert helpers.checkAppStatus(appUrl_network1 +"/home",10,15) == 0 : appUrl_network1 +"/home" + " was not accessible"
+              //FIXME: not able to validate https endpoints
+              //assert helpers.checkAppStatus(route53Url +"/home",10,15) == 0 : route53Url +"/home" + " was not accessible"
+              slackSend channel: "${channel}", color: 'good', message: "#${env.BUILD_NUMBER}-${branch_name} - Network Server Deploy Succeeded in PILOT Env: ${route53Url} \nJob: ${env.BUILD_URL}"
+          } catch (Exception e) {
+            // slackSend channel: "${channel}", color: 'danger', message: "#${env.BUILD_NUMBER}-${branch_name} - Network Server Deploy Failed in PILOT Env: ${route53Url} \nJob: ${env.BUILD_URL}"
+             error "deploy failed"
+          }
+      //  }
+	    }
+}
+if(profile == "develop") {
+		node(deployNode) {   
+      //  if(branchName=="develop") {
+      //  	deployService('ed-exchange-stack', "", "ed-exchange-develop", tag, "9E37A978894A2C107271", "UfiZswHv5j8Lj1iTGKPXMbinKjM4PmZgDS9K7SjX")
+      // 	}
+      //  else {
+          try {
+              helpers.setupLogio("syslog")
+			  
+			  unstash "compose-files"
+
+              //sh "profile=$profile docker-compose down"
+              //FIXME: need to determine if we should use RDS for the DB store, or at least mount a data volume
+              sh "profile=$profile docker-compose -f docker-compose-network-pilot.yml up -d"
+              sh "profile=$profile docker-compose -f docker-compose-network-pilot.yml logs > network_server1_logs.out &"
+              sleep 60
+              sh "cat network_server1_logs.out"
+              archive '**/*logs.out'
+              stage "validate endpoints"
+              assert helpers.checkAppStatus(appUrl_network1 +"/home",10,15) == 0 : appUrl_network1 +"/home" + " was not accessible"
+              //FIXME: not able to validate https endpoints
+              //assert helpers.checkAppStatus(route53Url +"/home",10,15) == 0 : route53Url +"/home" + " was not accessible"
+              slackSend channel: "${channel}", color: 'good', message: "#${env.BUILD_NUMBER}-${branch_name} - Network Server Deploy Succeeded in PILOT Env: ${route53Url} \nJob: ${env.BUILD_URL}"
+          } catch (Exception e) {
+            // slackSend channel: "${channel}", color: 'danger', message: "#${env.BUILD_NUMBER}-${branch_name} - Network Server Deploy Failed in PILOT Env: ${route53Url} \nJob: ${env.BUILD_URL}"
+             error "deploy failed"
+          }
+      //  }
+	    }
+}
+
